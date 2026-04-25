@@ -14,15 +14,37 @@ const packageJsonPath = path.join(__dirname, "..", "package.json");
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
 const SERVER_VERSION = packageJson.version;
 
+// Default 30 minutes; overridable via TERMINALCP_IDLE_TIMEOUT_MS for testing or tuning.
+const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+// How often the idle check runs. Overridable via TERMINALCP_IDLE_CHECK_INTERVAL_MS — primarily useful
+// for tests that need to verify cleanup behavior in seconds rather than minutes.
+const DEFAULT_IDLE_CHECK_INTERVAL_MS = 60 * 1000;
+
+function positiveIntEnv(key: string, fallback: number): number {
+	const n = parseInt(process.env[key] ?? "", 10);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 export class TerminalServer {
 	private processManager = new TerminalManager();
 	private server?: net.Server;
 	private clients = new Map<string, net.Socket>();
 	private sessionSubscribers = new Map<string, Set<string>>(); // sessionId -> Set<clientId>
-	public readonly serverSocketPath = path.join(os.homedir(), ".terminalcp", "server.sock");
+	public readonly serverSocketPath: string;
 	private clientCounter = 0;
+	private lastActivityAt = Date.now();
+	private idleCheckInterval?: NodeJS.Timeout;
+	private idleTimeoutMs: number;
+	private idleCheckIntervalMs: number;
 
 	constructor() {
+		// Allow per-instance socket path via env (set by mcp-server.ts when spawning a dedicated daemon).
+		// Falls back to the historical shared path so plain `terminalcp --server` and CLI commands still work.
+		this.serverSocketPath = process.env.TERMINALCP_SOCKET || path.join(os.homedir(), ".terminalcp", "server.sock");
+
+		this.idleTimeoutMs = positiveIntEnv("TERMINALCP_IDLE_TIMEOUT_MS", DEFAULT_IDLE_TIMEOUT_MS);
+		this.idleCheckIntervalMs = positiveIntEnv("TERMINALCP_IDLE_CHECK_INTERVAL_MS", DEFAULT_IDLE_CHECK_INTERVAL_MS);
+
 		// Ensure directory exists
 		const dir = path.dirname(this.serverSocketPath);
 		if (!fs.existsSync(dir)) {
@@ -59,15 +81,43 @@ export class TerminalServer {
 				// Set socket permissions to be user-only
 				fs.chmodSync(this.serverSocketPath, 0o600);
 
+				// Start idle-timeout watcher: shut down after N min of no clients AND no running sessions.
+				// The running-sessions guard means a long build keeps the daemon alive even if the
+				// client (e.g. an MCP server) disconnects — important so closing Claude Code mid-build
+				// doesn't kill the build.
+				this.idleCheckInterval = setInterval(() => this.checkIdle(), this.idleCheckIntervalMs);
+
 				resolve();
 			});
 		});
+	}
+
+	private touchActivity(): void {
+		this.lastActivityAt = Date.now();
+	}
+
+	private checkIdle(): void {
+		const idleMs = Date.now() - this.lastActivityAt;
+		const noClients = this.clients.size === 0;
+		const processes = this.processManager.listProcesses();
+		const noRunningSessions = !processes.some((p) => p.running);
+
+		if (noClients && noRunningSessions && idleMs >= this.idleTimeoutMs) {
+			console.error(
+				`[terminalcp] idle for ${Math.floor(idleMs / 1000)}s with no clients and no running sessions — shutting down`,
+			);
+			this.shutdown().catch((err) => {
+				console.error("Idle shutdown error:", err);
+				process.exit(0);
+			});
+		}
 	}
 
 	/**
 	 * Handle a new client connection
 	 */
 	private handleClient(socket: net.Socket): void {
+		this.touchActivity();
 		const clientId = `client-${++this.clientCounter}`;
 		this.clients.set(clientId, socket);
 
@@ -109,6 +159,7 @@ export class TerminalServer {
 	 * Handle a message from a client
 	 */
 	private async handleMessage(clientId: string, message: ServerRequest): Promise<void> {
+		this.touchActivity();
 		const { id: requestId, args } = message;
 
 		if (!requestId || !args.action) {
@@ -344,6 +395,12 @@ export class TerminalServer {
 	 */
 	async shutdown(): Promise<void> {
 		console.error("Shutting down terminal server...");
+
+		// Stop the idle-check timer so the process can exit cleanly.
+		if (this.idleCheckInterval) {
+			clearInterval(this.idleCheckInterval);
+			this.idleCheckInterval = undefined;
+		}
 
 		// Stop all processes
 		await this.processManager.stopAll();

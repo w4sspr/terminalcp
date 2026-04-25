@@ -1,11 +1,77 @@
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Args } from "./messages.js";
 import { TerminalClient } from "./terminal-client.js";
 
+async function waitForSocket(socketPath: string, timeoutMs: number): Promise<void> {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		if (fs.existsSync(socketPath)) return;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	throw new Error(`terminalcp daemon socket did not appear at ${socketPath} within ${timeoutMs}ms`);
+}
+
 export async function runMCPServer(): Promise<void> {
-	const serverClient = new TerminalClient();
+	// Per-session isolation: each MCP instance gets its own daemon at a unique socket path
+	// keyed by this process's PID. Closes the door on cross-session interference (one Claude
+	// Code window's cleanup can no longer touch another window's daemon).
+	const socketPath = path.join(os.tmpdir(), `terminalcp-mcp-${process.pid}.sock`);
+
+	// Spawn the dedicated daemon as a non-detached child so its lifecycle is bound to ours.
+	// Three layers of cleanup: (1) explicit kill below on SIGTERM/SIGINT/exit; (2) daemon's
+	// own idle timeout (defaults to 30min, gated on no-running-sessions so long builds aren't
+	// killed); (3) socket path is per-PID, so even leaks don't collide with other sessions.
+	const daemonScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.js");
+	const daemon = spawn(process.execPath, [daemonScript, "--server"], {
+		env: {
+			...process.env,
+			TERMINALCP_SOCKET: socketPath,
+		},
+		// stderr inherits so daemon errors surface in the MCP server's stderr (visible in
+		// Claude Code's MCP debug logs). stdin/stdout ignored — the daemon only talks via socket.
+		stdio: ["ignore", "ignore", "inherit"],
+		detached: false,
+	});
+
+	daemon.on("error", (err) => {
+		console.error("[terminalcp] daemon spawn error:", err);
+	});
+	daemon.on("exit", (code, signal) => {
+		console.error(`[terminalcp] daemon exited (code=${code}, signal=${signal})`);
+	});
+
+	// Idempotent kill helper, registered on every shutdown signal we care about.
+	let killed = false;
+	const killDaemon = (): void => {
+		if (killed) return;
+		killed = true;
+		try {
+			daemon.kill("SIGTERM");
+		} catch {
+			// Already dead — ignore.
+		}
+	};
+	process.on("exit", killDaemon);
+
+	// Block until the daemon has bound its socket. Without this, the first TerminalClient
+	// request would race the daemon's `listen()` and trigger the auto-spawn fallback path,
+	// which would create a *second* daemon (orphaned) at the same socket path.
+	try {
+		await waitForSocket(socketPath, 5000);
+	} catch (err) {
+		console.error("[terminalcp] daemon failed to start within 5s:", err);
+		killDaemon();
+		throw err;
+	}
+
+	const serverClient = new TerminalClient(socketPath);
 
 	const server = new Server(
 		{
@@ -179,15 +245,18 @@ Note: Commands run via bash -c. Use absolute paths, not aliases.`,
 		}
 	});
 
-	// Cleanup on exit
-	process.on("SIGINT", async () => {
-		console.error("Shutting down MCP server...");
+	// Cleanup on exit — both signals tear down client and daemon before exiting.
+	const shutdown = (signal: string) => {
+		console.error(`Shutting down MCP server (${signal})...`);
 		serverClient.close();
+		killDaemon();
 		process.exit(0);
-	});
+	};
+	process.on("SIGINT", () => shutdown("SIGINT"));
+	process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 	// Start the server
 	const transport = new StdioServerTransport();
 	await server.connect(transport);
-	console.error("terminalcp MCP server running on stdio");
+	console.error(`terminalcp MCP server running on stdio (daemon socket: ${socketPath})`);
 }

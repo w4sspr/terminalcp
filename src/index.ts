@@ -301,6 +301,28 @@ if (args[0] === "--mcp") {
 			console.error("Failed to start server:", err);
 			process.exit(1);
 		});
+
+		// SIGTERM is what mcp-server.ts sends; without these handlers we'd leave a stale
+		// socket file and skip clearing the idle-check timer.
+		for (const sig of ["SIGINT", "SIGTERM", "SIGQUIT"] as const) {
+			process.on(sig, () => {
+				console.error(`Received ${sig}, shutting down server...`);
+				server.shutdown().catch((err) => {
+					console.error("Shutdown error:", err);
+					process.exit(1);
+				});
+			});
+		}
+		process.on("exit", () => {
+			// Last-ditch socket cleanup if shutdown() didn't get to it.
+			if (fs.existsSync(server.serverSocketPath)) {
+				try {
+					fs.unlinkSync(server.serverSocketPath);
+				} catch {
+					// Already removed — ignore.
+				}
+			}
+		});
 	} else {
 		console.error(`Unknown command: ${args[0]}`);
 		console.error("Run 'terminalcp' without arguments to see help");

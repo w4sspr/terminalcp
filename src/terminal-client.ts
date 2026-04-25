@@ -33,12 +33,20 @@ const CLIENT_VERSION = packageJson.version;
 
 export class TerminalClient {
 	private socket?: net.Socket;
-	private serverSocketPath = path.join(os.homedir(), ".terminalcp", "server.sock");
+	private serverSocketPath: string;
 	// biome-ignore lint/suspicious/noExplicitAny: Hard to type this without a lot of effort
 	private pendingRequests = new Map<string, { resolve: (result: any) => void; reject: (error: Error) => void }>();
 	private eventHandlers = new Map<string, (event: ServerEvent) => void>();
 	private connected = false;
 	private connectPromise?: Promise<void>;
+
+	constructor(socketPath?: string) {
+		// Explicit arg > env var > historical default. The env var lets a daemon spawned by the
+		// auto-spawn path (which inherits env from the client process) bind to the same per-instance
+		// socket the client is connecting to.
+		this.serverSocketPath =
+			socketPath || process.env.TERMINALCP_SOCKET || path.join(os.homedir(), ".terminalcp", "server.sock");
+	}
 
 	/**
 	 * Connect to the terminal server, starting it if necessary
