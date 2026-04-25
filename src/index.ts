@@ -7,6 +7,7 @@ import { AttachClient } from "./attach-client.js";
 import { parseKeyInput } from "./key-parser.js";
 import { runMCPServer } from "./mcp-server.js";
 import { TerminalClient } from "./terminal-client.js";
+import { getLogDir } from "./terminal-manager.js";
 import { TerminalServer } from "./terminal-server.js";
 
 // Read version from package.json
@@ -17,6 +18,83 @@ const CLIENT_VERSION = packageJson.version;
 
 // Parse CLI arguments
 const args = process.argv.slice(2);
+
+function formatAge(seconds: number): string {
+	if (seconds < 60) return `${seconds}s ago`;
+	if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+	if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+	return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+function formatSize(bytes: number): string {
+	if (bytes < 1024) return `${bytes}B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+type LogEntry = { name: string; path: string; mtime: number; size: number };
+
+function readLogEntries(logDir: string): LogEntry[] {
+	if (!fs.existsSync(logDir)) return [];
+	return fs
+		.readdirSync(logDir)
+		.filter((f) => f.endsWith(".log"))
+		.map((f): LogEntry | null => {
+			const fullPath = path.join(logDir, f);
+			try {
+				const stat = fs.statSync(fullPath);
+				return { name: f, path: fullPath, mtime: stat.mtimeMs, size: stat.size };
+			} catch {
+				return null;
+			}
+		})
+		.filter((e): e is LogEntry => e !== null)
+		.sort((a, b) => b.mtime - a.mtime);
+}
+
+function handleLogsCommand(logsArgs: string[]): void {
+	const logDir = getLogDir();
+	const entries = readLogEntries(logDir);
+
+	if (logsArgs[0] === "--rm") {
+		let removed = 0;
+		for (const e of entries) {
+			try {
+				fs.unlinkSync(e.path);
+				removed++;
+			} catch {
+				// best-effort
+			}
+		}
+		console.log(removed === 0 ? "No logs to remove." : `Removed ${removed} log file(s) from ${logDir}`);
+		process.exit(0);
+	}
+
+	if (entries.length === 0) {
+		console.log(`No logs found at ${logDir}`);
+		process.exit(0);
+	}
+
+	if (logsArgs.length === 0) {
+		for (const e of entries) {
+			const ageS = Math.floor((Date.now() - e.mtime) / 1000);
+			console.log(`  ${e.name}  (${formatAge(ageS)}, ${formatSize(e.size)})`);
+		}
+		console.log(`\n${entries.length} log file(s) in ${logDir}`);
+		process.exit(0);
+	}
+
+	// Cat the newest log whose filename starts with `${name}-` (timestamp suffix).
+	const sessionName = logsArgs[0];
+	const match = entries.find((e) => e.name.startsWith(`${sessionName}-`));
+	if (!match) {
+		console.error(`No log found matching: ${sessionName}`);
+		console.error(`Run 'terminalcp logs' (no args) to see available logs.`);
+		process.exit(1);
+	}
+	process.stdout.write(fs.readFileSync(match.path, "utf-8"));
+	process.exit(0);
+}
 
 // Show help if no arguments
 if (args.length === 0) {
@@ -40,6 +118,7 @@ COMMANDS:
   term-size <id>                         Get terminal size
   version                                Show client and server versions
   kill-server                            Shutdown the terminal server
+  logs [name]                            List session logs, or cat one by name (--rm to delete all)
 
 EXAMPLES:
   # Start as MCP server for Claude Desktop
@@ -295,6 +374,8 @@ if (args[0] === "--mcp") {
 				console.error("Failed to kill server:", err.message);
 				process.exit(1);
 			});
+	} else if (args[0] === "logs") {
+		handleLogsCommand(args.slice(1));
 	} else if (args[0] === "--server") {
 		const server = new TerminalServer();
 		server.start().catch((err) => {

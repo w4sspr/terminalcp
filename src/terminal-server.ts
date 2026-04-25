@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ServerEvent, ServerMessage, ServerRequest, ServerResponse } from "./messages.js";
-import { TerminalManager } from "./terminal-manager.js";
+import { getLogDir, TerminalManager } from "./terminal-manager.js";
 
 // Read version from package.json
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -81,6 +81,11 @@ export class TerminalServer {
 				// Set socket permissions to be user-only
 				fs.chmodSync(this.serverSocketPath, 0o600);
 
+				// One-shot cleanup of stale session logs at daemon startup so disk usage stays
+				// bounded over time. Default 7 days; configurable via TERMINALCP_LOG_RETENTION_DAYS
+				// (set to 0 to keep forever).
+				this.cleanupOldLogs();
+
 				// Start idle-timeout watcher: shut down after N min of no clients AND no running sessions.
 				// The running-sessions guard means a long build keeps the daemon alive even if the
 				// client (e.g. an MCP server) disconnects — important so closing Claude Code mid-build
@@ -94,6 +99,41 @@ export class TerminalServer {
 
 	private touchActivity(): void {
 		this.lastActivityAt = Date.now();
+	}
+
+	private cleanupOldLogs(): void {
+		const logDir = getLogDir();
+		if (!fs.existsSync(logDir)) return;
+
+		const retentionDaysStr = process.env.TERMINALCP_LOG_RETENTION_DAYS;
+		const retentionDays = retentionDaysStr ? parseInt(retentionDaysStr, 10) : 7;
+		// 0 (or any non-positive / non-finite value) disables cleanup — keep logs forever.
+		if (!Number.isFinite(retentionDays) || retentionDays <= 0) return;
+
+		const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+		let removed = 0;
+		try {
+			const files = fs.readdirSync(logDir);
+			for (const f of files) {
+				if (!f.endsWith(".log")) continue;
+				const fullPath = path.join(logDir, f);
+				try {
+					const stat = fs.statSync(fullPath);
+					if (stat.mtimeMs < cutoff) {
+						fs.unlinkSync(fullPath);
+						removed++;
+					}
+				} catch {
+					// Ignore individual file errors.
+				}
+			}
+		} catch (err) {
+			console.error("[terminalcp] log cleanup error:", err);
+			return;
+		}
+		if (removed > 0) {
+			console.error(`[terminalcp] cleaned up ${removed} log file(s) older than ${retentionDays} days`);
+		}
 	}
 
 	private checkIdle(): void {
@@ -147,6 +187,13 @@ export class TerminalServer {
 			// Remove client from all session subscriptions
 			for (const subscribers of this.sessionSubscribers.values()) {
 				subscribers.delete(clientId);
+			}
+
+			// Mechanism D: when the last MCP client disconnects, kick off disk persistence for any
+			// running sessions so the user can recover their output later. Idempotent — sessions
+			// that already have a logStream are skipped inside beginPersistRunningSessions.
+			if (this.clients.size === 0) {
+				this.processManager.beginPersistRunningSessions();
 			}
 		});
 

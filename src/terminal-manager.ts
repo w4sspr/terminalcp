@@ -1,8 +1,40 @@
 import crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import xterm from "@xterm/headless";
 import * as pty from "node-pty";
+
+// Logs land at ~/.terminalcp/logs/${name}-${timestamp}.log via two paths: a one-shot exit dump
+// (MCP attached the whole time) or a tee-on-disconnect stream (MCP gone mid-session). Override
+// dir via TERMINALCP_LOG_DIR.
+export function getLogDir(): string {
+	return process.env.TERMINALCP_LOG_DIR || path.join(os.homedir(), ".terminalcp", "logs");
+}
+
+function sanitizeName(name: string): string {
+	return name.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function fileTimestamp(d: Date): string {
+	return d.toISOString().replace(/[:.]/g, "-");
+}
+
+function logPathFor(logDir: string, proc: { id: string; startedAt: Date }): string {
+	return path.join(logDir, `${sanitizeName(proc.id)}-${fileTimestamp(proc.startedAt)}.log`);
+}
+
+function closeStream(proc: ManagedTerminal): void {
+	if (!proc.logStream) return;
+	try {
+		proc.logStream.end();
+	} catch {
+		// stream already destroyed — fine
+	}
+	proc.logStream = undefined;
+}
 
 class WriteQueue {
 	private queue = Promise.resolve();
@@ -33,6 +65,12 @@ export interface ManagedTerminal {
 	ptyWriteQueue: WriteQueue;
 	running: boolean;
 	exitCode?: number;
+	/**
+	 * Active write stream for tee'd persistence. Only set after beginPersistRunningSessions has
+	 * fired (i.e., all MCP clients disconnected while this session was running). When active, every
+	 * PTY chunk is also written here. On session exit the stream is closed and the file is final.
+	 */
+	logStream?: fs.WriteStream;
 }
 
 export class TerminalManager {
@@ -86,6 +124,16 @@ export class TerminalManager {
 		proc.onData((data) => {
 			processEntry.terminalWriteQueue.enqueue(async () => {
 				processEntry.rawOutput += data;
+				// Tee path D: if persistence has been turned on for this session, mirror each PTY chunk
+				// to disk as it arrives. Wrapped so a broken stream can't take down the daemon.
+				if (processEntry.logStream) {
+					try {
+						processEntry.logStream.write(data);
+					} catch (err) {
+						console.error(`[terminalcp] log stream write error for ${id}:`, err);
+						processEntry.logStream = undefined;
+					}
+				}
 				await new Promise<void>((resolve) => {
 					terminal.write(data, () => resolve());
 				});
@@ -107,9 +155,29 @@ export class TerminalManager {
 
 			processEntry.terminalWriteQueue.enqueue(async () => {
 				processEntry.rawOutput += exitMsg;
+				// Persist the exit message into a tee'd stream too, before we close it.
+				if (processEntry.logStream) {
+					try {
+						processEntry.logStream.write(exitMsg);
+					} catch {
+						// Ignore — closing anyway.
+					}
+				}
 				await new Promise<void>((resolve) => {
 					terminal.write(exitMsg, () => resolve());
 				});
+				// Two paths for log persistence on exit:
+				//   - If a tee stream is active (D), close it cleanly.
+				//   - Otherwise (A), do a one-shot dump of the full rawOutput. This is the common
+				//     case when Claude Code stayed attached the whole time — we still want a recovery
+				//     log on disk for the user to grep/cat later.
+				if (processEntry.logStream) {
+					closeStream(processEntry);
+				} else {
+					this.writeFinalLog(processEntry).catch((err) => {
+						console.error(`[terminalcp] final log dump failed for ${id}:`, err);
+					});
+				}
 			});
 		});
 
@@ -125,8 +193,54 @@ export class TerminalManager {
 		if (!proc) {
 			throw new Error(`Process not found: ${id}`);
 		}
+		// onExit may not fire when we kill directly — close any tee stream now so the file is sealed.
+		closeStream(proc);
 		proc.process.kill();
 		this.processes.delete(id);
+	}
+
+	/**
+	 * Begin persisting all currently-running sessions to disk. Called by the daemon when its last
+	 * MCP client disconnects, so any in-flight session (e.g. a long build that's still running
+	 * after Claude Code closed) can be recovered later via `terminalcp logs`. The current rawOutput
+	 * is written as the catch-up chunk, then onData appends each new chunk going forward.
+	 */
+	beginPersistRunningSessions(): void {
+		const logDir = getLogDir();
+		try {
+			fs.mkdirSync(logDir, { recursive: true });
+		} catch (err) {
+			console.error("[terminalcp] failed to create log dir:", err);
+			return;
+		}
+
+		for (const proc of this.processes.values()) {
+			if (!proc.running || proc.logStream) continue;
+			try {
+				const logPath = logPathFor(logDir, proc);
+				const stream = fs.createWriteStream(logPath, { flags: "w" });
+				stream.on("error", (err) => {
+					console.error(`[terminalcp] log stream error for ${proc.id}:`, err);
+					proc.logStream = undefined;
+				});
+				// Catch-up: flush everything so far, then onData will append new chunks as they arrive.
+				stream.write(proc.rawOutput);
+				proc.logStream = stream;
+				console.error(`[terminalcp] persisting ${proc.id} to ${logPath}`);
+			} catch (err) {
+				console.error(`[terminalcp] failed to begin persisting ${proc.id}:`, err);
+			}
+		}
+	}
+
+	/**
+	 * One-shot final dump of a session's rawOutput. Used by the exit path when no tee stream was
+	 * ever opened — i.e. the common case where Claude Code stayed attached the whole time.
+	 */
+	private async writeFinalLog(proc: ManagedTerminal): Promise<void> {
+		const logDir = getLogDir();
+		await fs.promises.mkdir(logDir, { recursive: true });
+		await fs.promises.writeFile(logPathFor(logDir, proc), proc.rawOutput);
 	}
 
 	/**
