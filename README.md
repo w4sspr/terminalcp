@@ -1,5 +1,8 @@
 # terminalcp
 
+> [!NOTE]
+> **Maintained fork.** This is a fork of [badlogic/terminalcp](https://github.com/badlogic/terminalcp) with macOS 26 Tahoe compatibility and three robustness improvements. See [Fork notes](#fork-notes) below — each change has its own upstream PR, and the fork retires when they land.
+
 https://github.com/user-attachments/assets/e19a83da-e446-4ccd-9028-9c1cc0e09a5e
 
 Let AI agents control interactive command-line tools like a human would.
@@ -23,6 +26,64 @@ Two output modes for different use cases:
 Each process runs in a proper pseudo-TTY with full terminal emulation, preserving colors, cursor movement, and special key sequences - exactly as if a human were typing at the keyboard. Processes run in the background, so your agent stays responsive while managing long-running tools.
 
 In addition to the MCP server, terminalcp comes with a CLI that can be used like tmux. You can also use the underlying technology in your NodeJS apps to drive CLI tools as part of your apps or tests. See below.
+
+## Fork notes
+
+This fork tracks `badlogic/terminalcp@1.3.3` plus four focused patches, each filed as its own upstream PR. Every change came from a specific failure I hit running terminalcp daily for AI-driven workflows.
+
+### 1. macOS 26 Tahoe compatibility — `node-pty` bump
+
+`node-pty 1.1.0` returns `posix_spawnp failed` on macOS 26 (kernel 25.3.0) even for `/bin/zsh` in `/tmp`. Direct `pty.spawn` under both node and bun reproduced, isolating the failure to bundled `node-pty`. Pinning `1.2.0-beta.12` (the beta cycle that exists for Tahoe) fixes it on first try.
+
+- Branch: [`macos26-nodepty-bump`](https://github.com/w4sspr/terminalcp/tree/macos26-nodepty-bump)
+- Upstream PR: [badlogic/terminalcp#4](https://github.com/badlogic/terminalcp/pull/4)
+
+### 2. Per-session daemon isolation + idle timeout
+
+The shared `~/.terminalcp/server.sock` singleton meant any `pkill terminalcp.*--server` or `kill-server` in one Claude Code window killed every parallel window's daemon. Each MCP server now spawns its own daemon at `${TMPDIR}/terminalcp-mcp-${pid}.sock`. Daemon self-exits after 30 min of (no clients **and** no running sessions), so long builds keep running after Claude Code closes but idle daemons self-clean.
+
+- Env overrides: `TERMINALCP_SOCKET`, `TERMINALCP_IDLE_TIMEOUT_MS`, `TERMINALCP_IDLE_CHECK_INTERVAL_MS`
+- Branch: [`per-session-isolation-and-idle-timeout`](https://github.com/w4sspr/terminalcp/tree/per-session-isolation-and-idle-timeout)
+- Upstream PR: [badlogic/terminalcp#5](https://github.com/badlogic/terminalcp/pull/5)
+
+### 3. Session log persistence with recovery
+
+A long Vercel deploy I'd left running died along with the daemon — its output was trapped in dead-daemon memory. Sessions now leave a recovery log at `~/.terminalcp/logs/${name}-${timestamp}.log` via two complementary write paths: a final-state dump on session exit (the common case, MCP attached throughout), and a tee-on-disconnect stream when the last MCP client drops while a session is still running. CLI: `terminalcp logs`, `terminalcp logs <name>`, `terminalcp logs --rm`. Logs auto-prune after 7 days.
+
+- Env overrides: `TERMINALCP_LOG_DIR`, `TERMINALCP_LOG_RETENTION_DAYS`
+- Branch: [`session-logs-with-recovery`](https://github.com/w4sspr/terminalcp/tree/session-logs-with-recovery)
+- Upstream PR: [badlogic/terminalcp#6](https://github.com/badlogic/terminalcp/pull/6)
+
+### 4. Transparent daemon auto-respawn
+
+After the daemon's idle timeout fires (or it crashes, or someone runs `kill-server`), the next tool call should respawn it without a manual `/mcp reconnect`. Four bugs in the existing client autospawn path were defeating that: a cached failed `connectPromise` poisoned subsequent calls (returning the same error in 9 ms), the promise wasn't cleared on socket close, the 1 s autospawn budget was too tight on Tahoe under load, and `TERMINALCP_SOCKET` wasn't propagated to respawned daemons. `test/recovery.test.ts` asserts end-to-end recovery in ~500 ms.
+
+- Branch: [`fix-daemon-autorespawn`](https://github.com/w4sspr/terminalcp/tree/fix-daemon-autorespawn)
+- Upstream PR: [badlogic/terminalcp#7](https://github.com/badlogic/terminalcp/pull/7)
+
+### Using the fork while the PRs are pending
+
+```json
+{
+  "mcpServers": {
+    "terminalcp": {
+      "command": "node",
+      "args": ["/path/to/terminalcp/dist/index.js", "--mcp"]
+    }
+  }
+}
+```
+
+```bash
+git clone https://github.com/w4sspr/terminalcp.git
+cd terminalcp && bun install && bun run build
+```
+
+When all four PRs merge upstream, swap your config back to the canonical `npx @mariozechner/terminalcp@latest --mcp` form below.
+
+### Security review
+
+I audited upstream `1.3.3` before installing — no network calls, no `eval`, no env-var exfil, all `child_process.spawn` paths legitimate, socket file mode `0o600`. The two `npm audit` warnings come from dead `@anthropic-ai/*` dependencies that the package never imports (already moved to devDependencies in upstream PR [#2](https://github.com/badlogic/terminalcp/pull/2) by @mindreframer).
 
 ## Requirements
 - Node.js 20 or newer
