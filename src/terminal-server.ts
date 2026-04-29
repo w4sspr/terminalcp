@@ -518,34 +518,3 @@ export async function startServer(socketPath?: string): Promise<void> {
 	// Give the server a moment to start
 	await new Promise((resolve) => setTimeout(resolve, 100));
 }
-
-// If run directly, start the server
-if (import.meta.url === `file://${process.argv[1]}`) {
-	const server = new TerminalServer();
-
-	server.start().catch((err) => {
-		console.error("Failed to start server:", err);
-		process.exit(1);
-	});
-
-	// Handle shutdown signals
-	process.on("SIGINT", async () => {
-		await server.shutdown();
-	});
-	process.on("SIGTERM", async () => {
-		await server.shutdown();
-	});
-	process.on("SIGQUIT", async () => {
-		await server.shutdown();
-	});
-	process.on("exit", () => {
-		// Last-ditch cleanup on any exit
-		if (fs.existsSync(server.serverSocketPath)) {
-			try {
-				fs.unlinkSync(server.serverSocketPath);
-			} catch (_err) {
-				// Ignore
-			}
-		}
-	});
-}
