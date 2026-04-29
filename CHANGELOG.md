@@ -69,6 +69,15 @@ This fork does not yet cut its own releases; entries land directly on `main`.
   instead of the per-PID path, so recovery never found the new daemon.
   (`6bdfa0c`)
 
+### Removed
+
+- **Unreachable `terminal-server.ts` direct-entry block.** Bottom-of-file
+  `if (import.meta.url === \`file://${process.argv[1]}\`)` was dead since
+  CLI dispatch moved to `index.ts`. Drops 31 lines of dead signal handlers
+  + cleanup that the live path already covers. Pre-existing in upstream —
+  branched independently of the four feature PRs.
+  (`2aae9d1`)
+
 ### Cross-cutting
 
 - Existing test suite (`tsx --test`) and Biome `check` pass on every commit.
@@ -86,5 +95,6 @@ chronological order on `main`:
 | `per-session-isolation-and-idle-timeout` | `351859d` | [badlogic/terminalcp#5](https://github.com/badlogic/terminalcp/pull/5) |
 | `session-logs-with-recovery` | `21d78af` | [badlogic/terminalcp#6](https://github.com/badlogic/terminalcp/pull/6) |
 | `fix-daemon-autorespawn` | `6bdfa0c` | [badlogic/terminalcp#7](https://github.com/badlogic/terminalcp/pull/7) |
+| `remove-unreachable-server-entry` | `2aae9d1` | [badlogic/terminalcp#8](https://github.com/badlogic/terminalcp/pull/8) |
 
 PR descriptions and pre-merge checks live in [README §Fork notes](README.md#fork-notes).

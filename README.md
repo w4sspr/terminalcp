@@ -29,7 +29,7 @@ In addition to the MCP server, terminalcp comes with a CLI that can be used like
 
 ## Fork notes
 
-This fork tracks `badlogic/terminalcp@1.3.3` plus four focused patches, each filed as its own upstream PR. Every change came from a specific failure I hit running terminalcp daily for AI-driven workflows.
+This fork tracks `badlogic/terminalcp@1.3.3` plus four focused patches and one drive-by cleanup, each filed as its own upstream PR. Every behavioral change came from a specific failure I hit running terminalcp daily for AI-driven workflows.
 
 ### 1. macOS 26 Tahoe compatibility — `node-pty` bump
 
@@ -61,6 +61,13 @@ After the daemon's idle timeout fires (or it crashes, or someone runs `kill-serv
 - Branch: [`fix-daemon-autorespawn`](https://github.com/w4sspr/terminalcp/tree/fix-daemon-autorespawn)
 - Upstream PR: [badlogic/terminalcp#7](https://github.com/badlogic/terminalcp/pull/7)
 
+### 5. Drive-by cleanup — remove unreachable `terminal-server.ts` entry
+
+While auditing the codebase, the opus simplification subagent flagged the bottom-of-file `if (import.meta.url === \`file://${process.argv[1]}\`)` block as unreachable: `terminal-server.js` is never the script entry — `terminalcp`'s bin maps to `dist/index.js`, and `index.ts`'s `--server` branch is the canonical daemon entry. Removed 31 lines of dead signal handlers + cleanup that the live path already covers. Pre-existing in upstream; branched independently of #1–#4.
+
+- Branch: [`remove-unreachable-server-entry`](https://github.com/w4sspr/terminalcp/tree/remove-unreachable-server-entry)
+- Upstream PR: [badlogic/terminalcp#8](https://github.com/badlogic/terminalcp/pull/8)
+
 ### Using the fork while the PRs are pending
 
 ```json
@@ -79,7 +86,7 @@ git clone https://github.com/w4sspr/terminalcp.git
 cd terminalcp && bun install && bun run build
 ```
 
-When all four PRs merge upstream, swap your config back to the canonical `npx @mariozechner/terminalcp@latest --mcp` form below.
+When all five PRs merge upstream, swap your config back to the canonical `npx @mariozechner/terminalcp@latest --mcp` form below.
 
 ### Security review
 
