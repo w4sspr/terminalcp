@@ -475,7 +475,7 @@ export class TerminalServer {
 	}
 }
 
-export async function startServer(): Promise<void> {
+export async function startServer(socketPath?: string): Promise<void> {
 	// Determine how to start the server
 	let command: string;
 	let args: string[];
@@ -502,10 +502,15 @@ export async function startServer(): Promise<void> {
 		args = [path.join(path.dirname(scriptPath), "index.js"), "--server"];
 	}
 
+	// Propagate TERMINALCP_SOCKET so the daemon binds to the same socket the caller
+	// expects. Without this, an autospawn fallback from a per-PID-isolated MCP server
+	// would silently bind to the historical singleton path and never be found.
+	const env = socketPath ? { ...process.env, TERMINALCP_SOCKET: socketPath } : process.env;
 	const serverProcess = spawn(command, args, {
 		detached: true,
 		stdio: "ignore",
 		cwd: process.cwd(),
+		env,
 	});
 
 	serverProcess.unref(); // Allow parent to exit independently

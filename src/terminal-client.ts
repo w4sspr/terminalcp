@@ -31,6 +31,9 @@ const packageJsonPath = path.join(__dirname, "..", "package.json");
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
 const CLIENT_VERSION = packageJson.version;
 
+// Matches mcp-server.ts's waitForSocket — detached node startup on macOS under load can exceed 1s.
+const SPAWN_TIMEOUT_MS = 5000;
+
 export class TerminalClient {
 	private socket?: net.Socket;
 	private serverSocketPath: string;
@@ -52,17 +55,15 @@ export class TerminalClient {
 	 * Connect to the terminal server, starting it if necessary
 	 */
 	async connect(skipVersionCheck = false, autoStart = true): Promise<void> {
-		// If already connecting, wait for that
-		if (this.connectPromise) {
-			return this.connectPromise;
-		}
+		if (this.connectPromise) return this.connectPromise;
+		if (this.connected) return;
 
-		// If already connected, return immediately
-		if (this.connected) {
-			return;
-		}
-
-		this.connectPromise = this.doConnect(skipVersionCheck, autoStart);
+		// Always clear once settled — `connected`/`socket` is the source of truth; a cached
+		// promise has no further use either way, and never clearing on success would re-use
+		// it after a socket close.
+		this.connectPromise = this.doConnect(skipVersionCheck, autoStart).finally(() => {
+			this.connectPromise = undefined;
+		});
 		return this.connectPromise;
 	}
 
@@ -80,26 +81,20 @@ export class TerminalClient {
 				throw new Error("No server running");
 			}
 
-			// Start the server (will be same version)
-			await startServer();
+			// Pass socketPath so per-PID isolation respawns at the right path (otherwise the
+			// daemon binds the singleton path and the autospawn never finds it).
+			await startServer(this.serverSocketPath);
 
-			// Wait for server to start with retries
-			let retries = 10;
-			while (retries > 0) {
+			const deadline = Date.now() + SPAWN_TIMEOUT_MS;
+			while (Date.now() < deadline) {
+				if (await this.isServerRunning()) break;
 				await new Promise((resolve) => setTimeout(resolve, 100));
-				if (await this.isServerRunning()) {
-					break;
-				}
-				retries--;
 			}
-
-			if (retries === 0) {
+			if (!(await this.isServerRunning())) {
 				throw new Error("Failed to start server");
 			}
 
-			// Try to connect
 			await this.connectToServer();
-			// No need to check version - we just started it
 		}
 	}
 
@@ -158,16 +153,17 @@ export class TerminalClient {
 	 */
 	private async connectToServer(): Promise<void> {
 		return new Promise((resolve, reject) => {
-			this.socket = net.createConnection(this.serverSocketPath);
+			const socket = net.createConnection(this.serverSocketPath);
+			this.socket = socket;
 
 			let buffer = "";
 
-			this.socket.on("connect", () => {
+			socket.on("connect", () => {
 				this.connected = true;
 				resolve();
 			});
 
-			this.socket.on("data", (data) => {
+			socket.on("data", (data) => {
 				buffer += data.toString();
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
@@ -184,18 +180,20 @@ export class TerminalClient {
 				}
 			});
 
-			this.socket.on("close", () => {
+			socket.on("close", () => {
+				// A reconnect can replace this.socket between connect-time and close-time —
+				// only act if we're still the active one.
+				if (this.socket !== socket) return;
 				this.connected = false;
 				this.socket = undefined;
 
-				// Reject all pending requests
 				for (const [_id, { reject }] of this.pendingRequests) {
 					reject(new Error("Server connection closed"));
 				}
 				this.pendingRequests.clear();
 			});
 
-			this.socket.on("error", (err) => {
+			socket.on("error", (err) => {
 				this.connected = false;
 				reject(err);
 			});
